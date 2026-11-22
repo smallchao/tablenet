@@ -23,6 +23,7 @@ type ticket struct {
 	codecs       []string
 	entered      time.Time
 	offlineSince time.Time
+	paused       bool // 玩家暂停（去打别的局了）：留着位置，不参与配对
 }
 
 type proposal struct {
@@ -86,6 +87,9 @@ type queueEnterBody struct {
 }
 
 func (h *Hub) onQueueEnter(c *conn, env proto.Envelope) {
+	if h.refuseIfDraining(c, env) {
+		return
+	}
 	var b queueEnterBody
 	if err := env.Decode(&b); err != nil {
 		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, err.Error()))
@@ -150,6 +154,22 @@ func intersect(want, have []string) []string {
 	return out
 }
 
+// onQueuePause：暂停／恢复排队，位置不变。暂停期间不参与配对。
+func (h *Hub) onQueuePause(c *conn, env proto.Envelope, paused bool) {
+	t := h.tickets[c.playerID]
+	if t == nil {
+		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, "没有在排队"))
+		return
+	}
+	t.paused = paused
+	if paused {
+		h.send(c, proto.New("queue.paused", "", env.ID, nil))
+		return
+	}
+	h.send(c, proto.New("queue.resumed", "", env.ID, nil))
+	h.tryMatch(t)
+}
+
 func (h *Hub) onQueueLeave(c *conn, env proto.Envelope) {
 	delete(h.tickets, c.playerID)
 	h.send(c, proto.New("queue.left", "", env.ID, map[string]any{"reason": "left"}))
@@ -159,7 +179,7 @@ func (h *Hub) onQueueLeave(c *conn, env proto.Envelope) {
 func (h *Hub) waitingTickets() []*ticket {
 	list := []*ticket{}
 	for _, t := range h.tickets {
-		if t.offlineSince.IsZero() {
+		if t.offlineSince.IsZero() && !t.paused {
 			list = append(list, t)
 		}
 	}

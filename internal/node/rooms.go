@@ -1,6 +1,7 @@
 package node
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 
@@ -28,7 +29,9 @@ type room struct {
 	suspendedUntil time.Time
 
 	matchID string
-	allowed map[string]bool // 私密房只收这些人
+	// codecInfo：按这间房的编码由客户端自己解释的大厅信息（独弈的座位摆法、变体、预算……），节点原样存、原样给
+	codecInfo json.RawMessage
+	allowed   map[string]bool // 私密房只收这些人
 }
 
 var gameTypes = map[string]bool{"duel": true, "2hg": true, "ffa": true, "teams": true, "draft-pod": true}
@@ -44,6 +47,9 @@ func (h *Hub) roomJSON(r *room, admin bool) map[string]any {
 	}
 	if r.codec != "" {
 		m["codec"] = r.codec
+	}
+	if len(r.codecInfo) > 0 {
+		m["codecInfo"] = r.codecInfo
 	}
 	if r.ownerPlayer != "" {
 		m["host"] = map[string]string{"playerId": r.ownerPlayer, "displayName": r.hostName}
@@ -89,9 +95,13 @@ func (h *Hub) removeRoom(id, why string) {
 	}
 	was := r.listed()
 	delete(h.rooms, id)
-	for chID, ch := range h.channels {
-		if ch.roomID == id {
-			h.closeChannel(chID, why, 0)
+	// 外部平台的房间被撤，只表示「大厅里不再列它」：桥接通道的另一端是适配器，由适配器自己决定什么时候关
+	// （适配器掉线时 dropConn 会一起关）。不然对方平台一开局、房间从大厅撤下，正在打的桥接局就被节点掐断了。
+	if r.venue == proto.VenueNative {
+		for chID, ch := range h.channels {
+			if ch.roomID == id {
+				h.closeChannel(chID, why, 0)
+			}
 		}
 	}
 	if was {
@@ -141,16 +151,18 @@ type spectateBody struct {
 }
 
 type roomOpenBody struct {
-	Title       string       `json:"title"`
-	Format      string       `json:"format"`
-	GameType    string       `json:"gameType"`
-	Seats       seatsBody    `json:"seats"`
-	Structure   string       `json:"structure"`
-	HasPassword bool         `json:"hasPassword"`
-	Visibility  string       `json:"visibility"`
-	Spectate    spectateBody `json:"spectate"`
-	Codec       string       `json:"codec"`
-	Status      string       `json:"status"`
+	Title       string          `json:"title"`
+	Format      string          `json:"format"`
+	GameType    string          `json:"gameType"`
+	Seats       seatsBody       `json:"seats"`
+	Structure   string          `json:"structure"`
+	HasPassword bool            `json:"hasPassword"`
+	Visibility  string          `json:"visibility"`
+	Spectate    spectateBody    `json:"spectate"`
+	Codec       string          `json:"codec"`
+	Status      string          `json:"status"`
+	CodecInfo   json.RawMessage `json:"codecInfo"`
+	Code        string          `json:"code"` // 指定房号（只有原生房的 room.open 认）
 }
 
 func (h *Hub) ownedRooms(playerID string) int {
@@ -173,6 +185,9 @@ func (h *Hub) newCode() string {
 }
 
 func (h *Hub) onRoomOpen(c *conn, env proto.Envelope) {
+	if h.refuseIfDraining(c, env) {
+		return
+	}
 	var b roomOpenBody
 	if err := env.Decode(&b); err != nil {
 		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, err.Error()))
@@ -180,10 +195,6 @@ func (h *Hub) onRoomOpen(c *conn, env proto.Envelope) {
 	}
 	if !contains(c.venues, proto.VenueNative) {
 		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, "握手时没声明能当主机（venues 里没有 native）"))
-		return
-	}
-	if h.ownedRooms(c.playerID) >= h.cfg.Limits.MaxRoomsPerPlayer {
-		h.send(c, proto.Error(env.ID, proto.CodeLimitReached, "开的房间太多了"))
 		return
 	}
 	r, msg := h.buildRoom(b)
@@ -195,7 +206,42 @@ func (h *Hub) onRoomOpen(c *conn, env proto.Envelope) {
 		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, "原生房必须带 codec，且是握手时声明过的"))
 		return
 	}
-	r.code = h.newCode()
+	// 指定房号：再来一局按原号重开、排队配上后接手节点替你开好的房、轮抓里各桌按对阵表约好的号。
+	// 这个号已经是自己的房就接着用（换上新参数，留着邀请名单和配对编号），是别人的就拒。
+	if b.Code != "" {
+		code := strings.ToUpper(strings.TrimSpace(b.Code))
+		if !validRoomCode(code) {
+			h.send(c, proto.Error(env.ID, proto.CodeBadRequest, "code 要 4–12 位字母或数字"))
+			return
+		}
+		if old := h.rooms[h.cfg.Node.PublicHost+"/"+code]; old != nil {
+			if old.ownerPlayer != c.playerID || old.venue != proto.VenueNative {
+				h.send(c, proto.Error(env.ID, proto.CodeRoomTaken, "这个房号有人在用"))
+				return
+			}
+			was := old.listed()
+			r.id, r.code, r.venue, r.joinKind = old.id, old.code, old.venue, old.joinKind
+			r.ownerPlayer, r.hostName, r.createdAt = c.playerID, c.displayName, old.createdAt
+			r.allowed, r.matchID = old.allowed, old.matchID
+			if old.visibility == "private" {
+				r.visibility = "private" // 节点替你开的私密房（排队配上的）不因重开变公开
+			}
+			h.rooms[r.id] = r
+			h.send(c, proto.New("room.opened", "", env.ID, map[string]any{"room": h.roomJSON(r, false)}))
+			h.notifyRoom(r, was)
+			h.log.Info("room.reopen", "room", r.id, "player", short(c.playerID))
+			return
+		}
+	}
+	if h.ownedRooms(c.playerID) >= h.cfg.Limits.MaxRoomsPerPlayer {
+		h.send(c, proto.Error(env.ID, proto.CodeLimitReached, "开的房间太多了"))
+		return
+	}
+	if b.Code != "" {
+		r.code = strings.ToUpper(strings.TrimSpace(b.Code))
+	} else {
+		r.code = h.newCode()
+	}
 	r.id = h.cfg.Node.PublicHost + "/" + r.code
 	r.venue, r.joinKind = proto.VenueNative, "native"
 	r.ownerPlayer, r.hostName = c.playerID, c.displayName
@@ -260,7 +306,42 @@ func (h *Hub) buildRoom(b roomOpenBody) (*room, string) {
 		}
 		r.status = b.Status
 	}
+	if msg := setCodecInfo(r, b.CodecInfo); msg != "" {
+		return nil, msg
+	}
 	return r, ""
+}
+
+// validRoomCode：指定的房号 4–12 位，大写字母或数字。
+func validRoomCode(code string) bool {
+	if len(code) < 4 || len(code) > 12 {
+		return false
+	}
+	for _, r := range code {
+		if !(r >= 0x41 && r <= 0x5a) && !(r >= 0x30 && r <= 0x39) {
+			return false
+		}
+	}
+	return true
+}
+
+// MaxCodecInfo 是 codecInfo 序列化后的上限（字节）。
+const MaxCodecInfo = 1024
+
+// setCodecInfo 只认 JSON 对象、限长；空的（没给或 null）不动。
+func setCodecInfo(r *room, raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	if len(raw) > MaxCodecInfo {
+		return "codecInfo 太长"
+	}
+	var obj map[string]any
+	if json.Unmarshal(raw, &obj) != nil {
+		return "codecInfo 必须是 JSON 对象"
+	}
+	r.codecInfo = append(json.RawMessage(nil), raw...)
+	return ""
 }
 
 func clamp(v, lo, hi int) int {
@@ -274,12 +355,13 @@ func clamp(v, lo, hi int) int {
 }
 
 type roomUpdateBody struct {
-	RoomID     string       `json:"roomId"`
-	Title      *string      `json:"title"`
-	Seats      seatsBody    `json:"seats"`
-	Visibility string       `json:"visibility"`
-	Status     string       `json:"status"`
-	Spectate   spectateBody `json:"spectate"`
+	RoomID     string          `json:"roomId"`
+	Title      *string         `json:"title"`
+	Seats      seatsBody       `json:"seats"`
+	Visibility string          `json:"visibility"`
+	Status     string          `json:"status"`
+	Spectate   spectateBody    `json:"spectate"`
+	CodecInfo  json.RawMessage `json:"codecInfo"`
 }
 
 func (h *Hub) ownRoom(c *conn, env proto.Envelope, roomID string) *room {
@@ -327,6 +409,10 @@ func (h *Hub) onRoomUpdate(c *conn, env proto.Envelope) {
 	if b.Spectate.SeeHands != nil {
 		r.seeHands = *b.Spectate.SeeHands
 	}
+	if msg := setCodecInfo(r, b.CodecInfo); msg != "" {
+		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, msg))
+		return
+	}
 	h.send(c, proto.New("room.updated", "", env.ID, map[string]any{"room": h.roomJSON(r, false)}))
 	h.notifyRoom(r, was)
 }
@@ -366,6 +452,10 @@ func (h *Hub) onRoomJoin(c *conn, env proto.Envelope) {
 		h.send(c, proto.Error(env.ID, proto.CodeBadRequest, "as 只能是 player 或 spectator"))
 		return
 	}
+	// 只给房号（玩家口头报的那 6 位）也认：补上本节点的主机名，大小写不论
+	if !strings.Contains(b.RoomID, "/") {
+		b.RoomID = h.cfg.Node.PublicHost + "/" + strings.ToUpper(strings.TrimSpace(b.RoomID))
+	}
 	r := h.rooms[b.RoomID]
 	if r == nil || (r.visibility == "private" && !r.allowed[c.playerID]) {
 		h.send(c, proto.Error(env.ID, proto.CodeNoRoom, "没有这个房间"))
@@ -374,6 +464,9 @@ func (h *Hub) onRoomJoin(c *conn, env proto.Envelope) {
 	if b.As == "spectator" && !r.spectateAllowed {
 		h.send(c, proto.Error(env.ID, proto.CodeSpectateDisabled, "这间房不让观战"))
 		return
+	}
+	if b.As == "player" && r.status == "waiting" && h.refuseIfDraining(c, env) {
+		return // 排空中：还没开打的房不再收人；已开打的（掉线回来、观战）照常
 	}
 	if b.As == "player" && r.status == "waiting" && r.seatsTaken+r.seatsAI >= r.seatsTotal {
 		h.send(c, proto.Error(env.ID, proto.CodeRoomFull, "坐满了"))

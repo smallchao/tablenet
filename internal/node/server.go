@@ -37,6 +37,7 @@ type Server struct {
 	public *http.Server
 	admin  *http.Server
 	wg     sync.WaitGroup
+	pub    *publisher // 并入自组网时才有
 }
 
 func NewServer(cfg Config, log *slog.Logger) (*Server, error) {
@@ -52,7 +53,11 @@ func NewServer(cfg Config, log *slog.Logger) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Server{Hub: hub, cfg: cfg, log: log, token: tok}, nil
+	s := &Server{Hub: hub, cfg: cfg, log: log, token: tok}
+	if cfg.Directory.Enabled {
+		s.pub = newPublisher(s)
+	}
+	return s, nil
 }
 
 // Handler 是公开端口上的全部路由（测试里直接拿它起 httptest）。
@@ -62,6 +67,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/node.json", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, s.Hub.NodeInfo()) })
 	mux.HandleFunc("/stats.json", func(w http.ResponseWriter, _ *http.Request) { writeJSON(w, s.Hub.Snapshot()) })
+	mux.HandleFunc("/metrics", s.serveMetrics)
 	return mux
 }
 
@@ -235,6 +241,32 @@ func (s *Server) AdminHandler() http.Handler {
 	mux.HandleFunc("/adapter-key", post(func(w http.ResponseWriter, r *http.Request) {
 		ok(w, s.Hub.AdminSetAdapterKey(r.URL.Query().Get("platform"), r.URL.Query().Get("key")))
 	}))
+	mux.HandleFunc("/drain", post(func(w http.ResponseWriter, _ *http.Request) {
+		s.Hub.SetDraining(true)
+		if s.pub != nil {
+			s.pub.poke() // 马上把名片改成 draining，名录不再推荐
+		}
+		writeJSON(w, map[string]any{"ok": true, "activeChannels": s.Hub.ActiveChannels()})
+	}))
+	mux.HandleFunc("/undrain", post(func(w http.ResponseWriter, _ *http.Request) {
+		s.Hub.SetDraining(false)
+		if s.pub != nil {
+			s.pub.poke()
+		}
+		ok(w, nil)
+	}))
+	mux.HandleFunc("/directory", auth(func(w http.ResponseWriter, _ *http.Request) {
+		if s.pub == nil {
+			writeJSON(w, map[string]any{"enabled": false})
+			return
+		}
+		st := s.pub.status()
+		st["enabled"] = true
+		if card, err := s.pub.Card(); err == nil {
+			st["card"] = json.RawMessage(card.Text)
+		}
+		writeJSON(w, st)
+	}))
 	return mux
 }
 
@@ -265,16 +297,34 @@ func (s *Server) Run(ctx context.Context) error {
 	}
 	s.log.Info("node.start", "nodeId", s.Hub.NodeID, "ws", s.cfg.Listen.WS, "admin", s.cfg.Listen.Admin,
 		"tls", s.cfg.Listen.TLSCert != "", "version", Version)
+	if rooms, tickets, err := s.Hub.LoadState(); err != nil {
+		s.log.Warn("state.load", "err", err)
+	} else if rooms+tickets > 0 {
+		s.log.Info("state.load", "rooms", rooms, "tickets", tickets)
+	}
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	saver := time.NewTicker(15 * time.Second)
+	defer saver.Stop()
 	s.superviseAdapters(ctx)
+	if s.pub != nil {
+		s.wg.Add(1)
+		go func() { defer s.wg.Done(); s.pub.run(ctx) }()
+	}
 	for {
 		select {
 		case <-ticker.C:
 			s.Hub.Tick()
+		case <-saver.C:
+			if err := s.Hub.SaveState(); err != nil {
+				s.log.Warn("state.save", "err", err)
+			}
 		case err := <-errs:
 			return err
 		case <-ctx.Done():
+			if err := s.Hub.SaveState(); err != nil { // 先存，再断开连接
+				s.log.Warn("state.save", "err", err)
+			}
 			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			_ = s.public.Shutdown(sctx)

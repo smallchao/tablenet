@@ -50,6 +50,7 @@ type Hub struct {
 
 	startedAt time.Time
 	daily     dailyStats
+	draining  bool // 排空中：不接新局，等现有对局打完（spec/09#节点自身要补的）
 	lastQueue time.Time
 }
 
@@ -83,6 +84,8 @@ type conn struct {
 
 	tokens   float64
 	lastFill time.Time
+
+	nodeChallenge []byte
 }
 
 type dailyStats struct {
@@ -156,7 +159,15 @@ func (h *Hub) Open(ip string) (*conn, string) {
 }
 
 func (h *Hub) features() []string {
-	return []string{"queue", "results"}
+	return []string{"queue", "results", "node-proof"}
+}
+
+// nodeProof：客户端给了 nodeChallenge 才回，否则是 null。
+func (h *Hub) nodeProof(c *conn) any {
+	if c.nodeChallenge == nil {
+		return nil
+	}
+	return proto.SignNodeProof(h.key, c.nodeChallenge, c.playerID)
 }
 
 func (h *Hub) burst() int { return 2 * h.cfg.Limits.MessagesPerSecond }
@@ -256,6 +267,7 @@ func (h *Hub) HandleText(c *conn, data []byte) {
 		return
 	}
 	if !h.allow(c) {
+		metricRateLimited.Add(1)
 		h.send(c, proto.ErrorRetry(env.ID, proto.CodeRateLimited, "发得太快了", 1000))
 		return
 	}
@@ -304,6 +316,8 @@ func (h *Hub) HandleBinary(c *conn, data []byte) {
 	default:
 		return // 不是这条通道的人
 	}
+	metricRelayFrames.Add(1)
+	metricRelayBytes.Add(int64(len(data)))
 	h.push(h.conns[peer], outMsg{binary: true, data: data})
 }
 
@@ -337,6 +351,8 @@ type helloBody struct {
 	Features    []string        `json:"features"`
 	Locale      string          `json:"locale"`
 	Platform    *platformBody   `json:"platform"`
+	// NodeChallenge：客户端给的随机数，节点在 welcome 里用自己的密钥签名回去，证明自己就是这个编号（spec/09）。
+	NodeChallenge string `json:"nodeChallenge"`
 }
 
 func (h *Hub) onHello(c *conn, env proto.Envelope) {
@@ -358,6 +374,14 @@ func (h *Hub) onHello(c *conn, env proto.Envelope) {
 		return
 	}
 	c.playerID, c.client, c.locale, c.features = b.PlayerID, b.Client, b.Locale, b.Features
+	if b.NodeChallenge != "" {
+		ch, ok := proto.UnB64(b.NodeChallenge)
+		if !ok || len(ch) < 16 || len(ch) > 64 {
+			h.reject(c, env.ID, proto.CodeBadRequest, "nodeChallenge 要 16–64 字节的 b64")
+			return
+		}
+		c.nodeChallenge = ch
+	}
 	switch b.Role {
 	case "adapter":
 		h.helloAdapter(c, env, b)
@@ -371,6 +395,7 @@ func (h *Hub) onHello(c *conn, env proto.Envelope) {
 }
 
 func (h *Hub) reject(c *conn, re, code, msg string) {
+	metricHandshakeFail.Add(1)
 	h.send(c, proto.Error(re, code, msg))
 	h.kick(c, msg)
 }
@@ -399,6 +424,7 @@ func (h *Hub) helloPlayer(c *conn, env proto.Envelope, b helloBody) {
 		"you":         map[string]any{"playerId": c.playerID, "displayName": c.displayName, "banned": false},
 		"platforms":   h.platformList(),
 		"resumed":     resumed,
+		"nodeProof":   h.nodeProof(c),
 	}))
 	h.log.Info("player.hello", "player", short(c.playerID), "role", c.role)
 }
@@ -477,6 +503,8 @@ func (h *Hub) dispatchPlayer(c *conn, env proto.Envelope) {
 			h.onQueueEnter(c, env)
 		case "queue.leave":
 			h.onQueueLeave(c, env)
+		case "queue.pause", "queue.resume":
+			h.onQueuePause(c, env, env.Type == "queue.pause")
 		case "queue.accept", "queue.decline":
 			h.onQueueAnswer(c, env)
 		case "result.report":
@@ -513,6 +541,49 @@ func (h *Hub) Tick() {
 	}
 }
 
+// ---- 自组网 ----
+
+// cardState 给名片用：当前负载、挂了哪些平台、是否在排空。
+func (h *Hub) cardState() (proto.NodeLoad, []proto.VenueInfo, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	players := 0
+	for _, c := range h.conns {
+		if c.authed && c.role != "adapter" {
+			players++
+		}
+	}
+	venues := []proto.VenueInfo{}
+	for id, cid := range h.platforms {
+		if c := h.conns[cid]; c != nil && c.platform != nil {
+			venues = append(venues, proto.VenueInfo{PlatformID: id, Bridge: contains(c.platform.JoinKinds, "bridge")})
+		}
+	}
+	sort.Slice(venues, func(i, j int) bool { return venues[i].PlatformID < venues[j].PlatformID })
+	return proto.NodeLoad{Players: players, Rooms: len(h.rooms), Channels: len(h.channels)}, venues, h.draining
+}
+
+// SetDraining 进入／退出排空。
+func (h *Hub) SetDraining(on bool) {
+	h.mu.Lock()
+	h.draining = on
+	h.mu.Unlock()
+}
+
+// ActiveChannels：排空时看还剩几局在打。
+func (h *Hub) ActiveChannels() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.channels)
+}
+
+func (h *Hub) refuseIfDraining(c *conn, env proto.Envelope) bool {
+	if h.draining {
+		h.send(c, proto.Error(env.ID, proto.CodeDraining, "这台节点正在停机维护，不接新局；请换一台节点"))
+	}
+	return h.draining
+}
+
 // ---- 给 HTTP 和管理接口看的 ----
 
 func (h *Hub) Snapshot() map[string]any {
@@ -528,7 +599,8 @@ func (h *Hub) Snapshot() map[string]any {
 		"name": h.cfg.Node.Name, "nodeId": h.NodeID, "startedAt": h.startedAt.UTC().Format(time.RFC3339),
 		"connections": len(h.conns), "players": players, "rooms": len(h.rooms), "channels": len(h.channels),
 		"queued": len(h.tickets), "matches": len(h.proposals), "platforms": h.platformList(),
-		"today": map[string]any{"date": h.daily.day, "players": len(h.daily.players)},
+		"today":    map[string]any{"date": h.daily.day, "players": len(h.daily.players)},
+		"draining": h.draining,
 	}
 }
 

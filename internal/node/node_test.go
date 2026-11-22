@@ -546,6 +546,42 @@ func fakeAdapter(t *testing.T, n *testNode, key ed25519.PrivateKey, seat map[str
 	return ad
 }
 
+// 外部平台的房间从大厅撤下（比如那边开局了），正在用的桥接通道不能跟着断。
+func TestVenueRemoveKeepsBridgeChannel(t *testing.T) {
+	n := startNode(t, nil)
+	ad, err := client.Dial(ctx5(), n.url, proto.GenerateKey(), example.Hello())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ad.Close()
+	e, err := ad.Request(ctx5(), "venue.room.upsert", map[string]any{"localId": "b1", "format": "modern", "join": "bridge", "codec": example.Codec})
+	must(t, e, err, "venue.room.upserted")
+	go func() {
+		for {
+			m, err := ad.Next(context.Background())
+			if err != nil {
+				return
+			}
+			switch {
+			case m.IsFrame():
+				_ = ad.SendFrame(context.Background(), m.Channel, append([]byte("echo: "), m.Payload...))
+			case m.Env.Type == "venue.seat.request":
+				_ = ad.Reply(context.Background(), m.Env.ID, "venue.seat.bridged", map[string]any{})
+			}
+		}
+	}()
+	p := dialPlayer(t, n, nil, "玩家", []string{"example"}, []string{example.Codec})
+	e, err = p.Request(ctx5(), "room.join", map[string]any{"roomId": "test.local/example-b1"})
+	ch := uint32(must(t, e, err, "room.joined")["channel"].(float64))
+	if e, err := ad.Request(ctx5(), "venue.room.remove", map[string]any{"localId": "b1"}); err != nil || e.Type != "venue.room.removed" {
+		t.Fatal(e, err)
+	}
+	_ = p.SendFrame(ctx5(), ch, []byte("还在吗"))
+	if _, got, err := p.ExpectFrame(ctx5()); err != nil || string(got) != "echo: 还在吗" {
+		t.Fatal("撤房后桥接通道应当还通", string(got), err)
+	}
+}
+
 func TestBadHandoffIsDropped(t *testing.T) {
 	cases := []map[string]any{
 		{"url": "http://play.example.org/t/1"},                                 // 不是 https

@@ -7,6 +7,7 @@ pub mod envelope;
 pub mod frame;
 pub mod ident;
 pub mod room_code;
+pub mod signed;
 pub mod time;
 
 pub use envelope::Envelope;

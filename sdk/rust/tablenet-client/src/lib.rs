@@ -36,7 +36,17 @@ pub struct Client {
 impl Client {
     /// 连上节点并完成握手。`hello` 里放 role、displayName、venues、codecs、platform 这些，
     /// protocol／playerId／sig 由这里补上。
-    pub async fn connect(url: &str, key: &SecretKey, mut hello: Value) -> Result<Client, String> {
+    pub async fn connect(url: &str, key: &SecretKey, hello: Value) -> Result<Client, String> {
+        Self::connect_inner(url, key, hello, None).await
+    }
+
+    /// 连名录给的一台节点：要求 node.hello 的编号是 `node_id`，并验 welcome 里的节点身份证明（spec/09）。
+    /// TLS 证书指纹校验要靠调用方配好的连接器，这里只管身份证明。
+    pub async fn connect_node(url: &str, key: &SecretKey, hello: Value, node_id: &str) -> Result<Client, String> {
+        Self::connect_inner(url, key, hello, Some(node_id)).await
+    }
+
+    async fn connect_inner(url: &str, key: &SecretKey, mut hello: Value, expect: Option<&str>) -> Result<Client, String> {
         let (ws, _) = connect_async(url).await.map_err(|e| format!("连不上 {url}：{e}"))?;
         let mut c = Client {
             ws,
@@ -53,6 +63,11 @@ impl Client {
         }
         let nonce = nh.str_field("nonce").and_then(ident::unb64).ok_or("node.hello 缺 nonce")?;
         let node_id = nh.str_field("nodeId").ok_or("node.hello 缺 nodeId")?.to_string();
+        if let Some(want) = expect {
+            if node_id != want {
+                return Err(format!("对面自称 {node_id}，不是要连的节点 {want}"));
+            }
+        }
         if !nh.body.get("protocols").and_then(Value::as_array).is_some_and(|a| a.iter().any(|p| p == PROTOCOL)) {
             return Err("节点不讲 tablenet/1".into());
         }
@@ -60,6 +75,10 @@ impl Client {
         obj.insert("protocol".into(), json!(PROTOCOL));
         obj.insert("playerId".into(), json!(c.player_id));
         obj.insert("sig".into(), json!(ident::sign_hello(key, &nonce, &node_id)));
+        let challenge = expect.map(|_| ident::random_bytes::<24>());
+        if let Some(ch) = &challenge {
+            obj.insert("nodeChallenge".into(), json!(ident::b64(ch)));
+        }
         c.node_hello = nh.body;
         let reply = c.request("hello", hello).await?;
         if let Some(code) = reply.error_code() {
@@ -69,6 +88,12 @@ impl Client {
             return Err(format!("握手回的是 {}", reply.kind));
         }
         c.welcome = reply.body;
+        if let (Some(ch), Some(want)) = (&challenge, expect) {
+            let proof = c.welcome.get("nodeProof").and_then(Value::as_str).unwrap_or("");
+            if !tablenet_proto::signed::verify_node_proof(want, proof, ch, &c.player_id) {
+                return Err("节点没能证明自己的身份（可能被冒充）".into());
+            }
+        }
         Ok(c)
     }
 

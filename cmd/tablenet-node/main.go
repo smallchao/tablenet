@@ -17,11 +17,13 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"tablenet/internal/node"
+	"tablenet/pkg/proto"
 )
 
 const usage = `用法：
@@ -36,6 +38,9 @@ const usage = `用法：
       ban <playerId> [原因]      拉黑
       unban <playerId>           解除拉黑
       adapter-key <平台> <公钥>  换适配器公钥
+      directory                  名片和各名录的登记结果
+      drain                      排空：不接新局、名录不再推荐，等现有对局打完再停机
+      undrain                    取消排空
   tablenet-node version
 `
 
@@ -71,7 +76,7 @@ func main() {
 	case "run":
 		err = run(*cfgPath)
 	case "init":
-		err = writeExample(*cfgPath)
+		err = writeExample(*cfgPath, rest)
 	case "admin":
 		err = admin(*cfgPath, rest)
 	case "version":
@@ -110,14 +115,37 @@ func run(path string) error {
 	return srv.Run(ctx)
 }
 
-func writeExample(path string) error {
+// writeExample：不带参数写一份本机自测用的配置；带 --region 和 --public-host 写一份公网节点配置，
+// 并生成自签证书（spec/09）。
+func writeExample(path string, args []string) error {
 	if _, err := os.Stat(path); err == nil {
 		return fmt.Errorf("%s 已存在，不覆盖", path)
 	}
-	if err := os.WriteFile(path, []byte(node.ExampleConfig), 0o600); err != nil {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	region := fs.String("region", "", "地区（并入自组网时要填）："+strings.Join(proto.Regions, " "))
+	host := fs.String("public-host", "", "对外的 IP 或域名")
+	_ = fs.Parse(args)
+	if *region == "" {
+		if err := os.WriteFile(path, []byte(node.ExampleConfig), 0o600); err != nil {
+			return err
+		}
+		fmt.Println("已写入", path, "（本机自测用；要并入自组网，用 --region 和 --public-host 重新生成）")
+		return nil
+	}
+	if !proto.ValidRegion(*region) || *host == "" {
+		return fmt.Errorf("--region 要取 %s 之一，--public-host 要填对外的 IP 或域名", strings.Join(proto.Regions, " "))
+	}
+	dir := filepath.Dir(path)
+	if _, _, err := node.GenerateSelfSigned(filepath.Join(dir, "data", "tls"), []string{*host}); err != nil {
 		return err
 	}
-	fmt.Println("已写入", path)
+	if err := os.WriteFile(path, []byte(node.PublicConfig(*region, *host)), 0o600); err != nil {
+		return err
+	}
+	fp, _ := node.CertFingerprint(filepath.Join(dir, "data", "tls", "cert.pem"))
+	fmt.Println("已写入", path, "，并生成自签证书（指纹", fp, "）")
+	fmt.Println()
+	fmt.Println(node.ComplianceNotice)
 	return nil
 }
 
@@ -144,8 +172,10 @@ func admin(path string, args []string) error {
 		return nil
 	}
 	switch args[0] {
-	case "status", "rooms", "bans", "adapters":
+	case "status", "rooms", "bans", "adapters", "directory":
 		route = "/" + args[0]
+	case "drain", "undrain":
+		method, route = http.MethodPost, "/"+args[0]
 	case "close":
 		if err := need(1); err != nil {
 			return err

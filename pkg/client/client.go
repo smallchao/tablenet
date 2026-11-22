@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 	"time"
 
 	"github.com/coder/websocket"
 
+	"tablenet/pkg/discovery"
 	"tablenet/pkg/proto"
 )
 
@@ -43,7 +45,32 @@ type Client struct {
 
 // Dial 连上节点并完成握手。hello 里放 role、displayName、venues、codecs、platform；protocol／playerId／sig 由这里补。
 func Dial(ctx context.Context, url string, key ed25519.PrivateKey, hello map[string]any) (*Client, error) {
-	ws, _, err := websocket.Dial(ctx, url, nil)
+	return DialWith(ctx, url, key, hello, Options{})
+}
+
+// Options：连一台从名录找到的节点时用。
+type Options struct {
+	// HTTPClient 用来做 WebSocket 握手；连自签证书的节点时用 discovery.HTTPClientFor 给的（按指纹校验）。
+	HTTPClient *http.Client
+	// ExpectNodeID 不为空时，要求对面就是这台节点：node.hello 的编号对得上，而且 welcome 里的节点证明验得过。
+	ExpectNodeID string
+}
+
+// DialNode 连名录给的一台节点：按名片里的证书指纹校验 TLS，并要求节点证明身份。
+func DialNode(ctx context.Context, card proto.NodeCard, endpoint int, key ed25519.PrivateKey, hello map[string]any) (*Client, error) {
+	if endpoint < 0 || endpoint >= len(card.Endpoints) {
+		return nil, errors.New("没有这个地址")
+	}
+	e := card.Endpoints[endpoint]
+	return DialWith(ctx, e.URL, key, hello, Options{HTTPClient: discovery.HTTPClientFor(e), ExpectNodeID: card.NodeID})
+}
+
+func DialWith(ctx context.Context, url string, key ed25519.PrivateKey, hello map[string]any, o Options) (*Client, error) {
+	var dopts *websocket.DialOptions
+	if o.HTTPClient != nil {
+		dopts = &websocket.DialOptions{HTTPClient: o.HTTPClient}
+	}
+	ws, _, err := websocket.Dial(ctx, url, dopts)
 	if err != nil {
 		return nil, fmt.Errorf("连不上 %s：%w", url, err)
 	}
@@ -79,7 +106,16 @@ func Dial(ctx context.Context, url string, key ed25519.PrivateKey, hello map[str
 	if hello == nil {
 		hello = map[string]any{}
 	}
+	if o.ExpectNodeID != "" && body.NodeID != o.ExpectNodeID {
+		ws.CloseNow()
+		return nil, fmt.Errorf("对面自称 %s，不是要连的节点 %s", body.NodeID, o.ExpectNodeID)
+	}
 	hello["protocol"], hello["playerId"], hello["sig"] = proto.Protocol, c.PlayerID, proto.SignHello(key, nonce, body.NodeID)
+	var challenge []byte
+	if o.ExpectNodeID != "" {
+		challenge = proto.RandomBytes(24)
+		hello["nodeChallenge"] = proto.B64(challenge)
+	}
 	go c.readLoop()
 	reply, err := c.Request(ctx, "hello", hello)
 	if err != nil {
@@ -89,6 +125,13 @@ func Dial(ctx context.Context, url string, key ed25519.PrivateKey, hello map[str
 		return nil, fmt.Errorf("握手被拒：%s %s", code, string(reply.Body))
 	}
 	_ = reply.Decode(&c.Welcome)
+	if challenge != nil {
+		proof, _ := c.Welcome["nodeProof"].(string)
+		if !proto.VerifyNodeProof(o.ExpectNodeID, proof, challenge, c.PlayerID) {
+			c.Close()
+			return nil, errors.New("节点没能证明自己的身份（可能被冒充）")
+		}
+	}
 	return c, nil
 }
 

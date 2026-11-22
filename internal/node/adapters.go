@@ -79,6 +79,7 @@ func (h *Hub) helloAdapter(c *conn, env proto.Envelope, b helloBody) {
 		"session": fmt.Sprintf("s_%d", c.id), "resumeToken": proto.B64(proto.RandomBytes(18)),
 		"you":       map[string]any{"playerId": c.playerID, "displayName": p.Name, "banned": false},
 		"platforms": h.platformList(),
+		"nodeProof": h.nodeProof(c),
 	}))
 	h.log.Info("adapter.online", "platform", p.ID, "joinKinds", strings.Join(p.JoinKinds, ","))
 }

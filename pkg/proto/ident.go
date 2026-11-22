@@ -120,3 +120,11 @@ func LoadOrCreateKey(path string) (ed25519.PrivateKey, error) {
 	}
 	return ed25519.NewKeyFromSeed(seed), nil
 }
+
+// LoadKey 只读不建：文件不存在就报错（签根文书时用，免得误生成一把新根密钥）。
+func LoadKey(path string) (ed25519.PrivateKey, error) {
+	if _, err := os.Stat(path); err != nil {
+		return nil, fmt.Errorf("读密钥 %s：%w", path, err)
+	}
+	return LoadOrCreateKey(path)
+}

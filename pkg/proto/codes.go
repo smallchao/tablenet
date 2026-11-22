@@ -22,6 +22,8 @@ const (
 	CodeNotAuthenticated    = "not_authenticated"
 	CodeLimitReached        = "limit_reached"
 	CodeInternal            = "internal"
+	CodeRoomTaken           = "room_taken" // 指定的房号是别人的
+	CodeDraining            = "draining"   // 节点在排空，不接新局
 
 	CodePlatformConflict   = "platform_conflict"
 	CodePlatformNotAllowed = "platform_not_allowed"

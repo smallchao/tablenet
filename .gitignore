@@ -6,3 +6,10 @@ node_modules/
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# 节点、名录跑起来的数据与密钥：一律不进仓库
+data/
+*.key
+node.toml
+dir.toml
+state.json
