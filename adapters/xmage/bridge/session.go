@@ -129,10 +129,10 @@ func (s *Session) OnCallback(method string, raw json.RawMessage) {
 // GameOver：一局结束（END_GAME_INFO）。返回这一盘是不是也结束了。
 func (s *Session) GameOver(raw json.RawMessage, gameNumber int) bool {
 	var d struct {
-		Won        bool `json:"won"`
-		Wins       int  `json:"wins"`
-		Loses      int  `json:"loses"`
-		WinsNeeded int  `json:"winsNeeded"`
+		Won        bool   `json:"won"`
+		Wins       int    `json:"wins"`
+		WinsNeeded int    `json:"winsNeeded"`
+		MatchInfo  string `json:"matchInfo"`
 	}
 	_ = decode(raw, &d)
 	s.cur = nil
@@ -145,7 +145,10 @@ func (s *Session) GameOver(raw json.RawMessage, gameNumber int) bool {
 			}
 		}
 	}
-	matchOver := d.WinsNeeded <= 0 || d.Wins >= d.WinsNeeded || d.Loses >= d.WinsNeeded
+	// GameEndView 的 loses 不是「输了几局」（实测输家也是 0），所以盘有没有打完看 matchInfo：
+	// 打完是「You won the match!」「某某 won the match!」，平局是「… draw …」。
+	info := strings.ToLower(plain(d.MatchInfo))
+	matchOver := d.WinsNeeded <= 0 || d.Wins >= d.WinsNeeded || strings.Contains(info, "won the match") || strings.Contains(info, "draw")
 	s.h.Send(map[string]any{"type": "game_over", "winner": winner, "gameNumber": gameNumber, "matchOver": matchOver,
 		"winCondition": "AllOpponentsLost", "winSpellEffect": nil, "outcomes": []string{}})
 	return matchOver
@@ -154,10 +157,10 @@ func (s *Session) GameOver(raw json.RawMessage, gameNumber int) bool {
 func (s *Session) classify(p *Prompt) string {
 	switch p.Method {
 	case "GAME_SELECT":
-		if _, ok := p.Options["POSSIBLE_ATTACKERS"]; ok {
+		if _, ok := p.Options["possibleAttackers"]; ok {
 			return "attack"
 		}
-		if _, ok := p.Options["POSSIBLE_BLOCKERS"]; ok {
+		if _, ok := p.Options["possibleBlockers"]; ok {
 			return "block"
 		}
 		return "priority"
@@ -313,6 +316,18 @@ func (s *Session) validDefender(id string) bool {
 	return false
 }
 
+// targetIDs：GAME_TARGET 的候选。一般在 targets 里；从一组牌里挑（例如「哪个触发先上堆叠」）时 targets 为空，候选是 cards1。
+func (s *Session) targetIDs(p *Prompt) []string {
+	if len(p.Targets) > 0 {
+		return p.Targets
+	}
+	out := []string{}
+	for _, c := range p.Cards1 {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
 func (s *Session) intIDs(xs []string) []int {
 	out := []int{}
 	for _, x := range xs {
@@ -380,7 +395,7 @@ func (s *Session) emit() {
 		m := s.base("select")
 		cards, players, selCards, selPlayers := []int{}, []int{}, []int{}, []int{}
 		chosen := p.optionIDs("chosenTargets")
-		for _, t := range p.Targets {
+		for _, t := range s.targetIDs(p) {
 			if s.isPlayer(t) {
 				players = append(players, s.seatOf(t))
 				if contains(chosen, t) {
@@ -404,7 +419,7 @@ func (s *Session) emit() {
 		s.h.Send(s.buttons(L.t("完成", "Done"), "", !p.Flag, false))
 	case "attack":
 		m := s.base("attack")
-		cands := s.intIDs(p.optionIDs("POSSIBLE_ATTACKERS"))
+		cands := s.intIDs(p.optionIDs("possibleAttackers"))
 		declared := []int{}
 		for _, g := range s.view.Combat {
 			declared = append(declared, s.intIDs(g.Attackers)...)
@@ -438,7 +453,7 @@ func (s *Session) emit() {
 			attackers = append(attackers, s.intIDs(g.Attackers)...)
 		}
 		cands := []map[string]any{}
-		for _, b := range p.optionIDs("POSSIBLE_BLOCKERS") {
+		for _, b := range p.optionIDs("possibleBlockers") {
 			cands = append(cands, map[string]any{"blockerId": s.ids.of(b), "attackerIds": attackers})
 		}
 		m["blockerCandidates"] = cands
@@ -513,7 +528,7 @@ func (s *Session) degraded() {
 	L := s.lab
 	s.h.Send(map[string]any{"type": "modal_request", "promptId": s.pid, "kind": "options", "title": firstNonEmpty(plain(s.cur.Message), s.cur.Method),
 		"message": L.t("这一步独弈还不会显示，只能确定或取消", "Tablenet can't show this step yet; confirm or cancel"),
-		"min": 1, "max": 1, "cancelEnabled": false,
+		"min":     1, "max": 1, "cancelEnabled": false,
 		"options":       []map[string]any{{"id": 0, "label": L.t("确定", "OK")}, {"id": 1, "label": L.t("取消", "Cancel")}},
 		"revealedCards": []any{}, "revealTitle": "", "selectedOptionIds": []int{}})
 }
@@ -632,7 +647,7 @@ func (s *Session) OnCommand(c Command) {
 	case "target":
 		switch c.Command {
 		case "select_card":
-			if entStr == "" || !contains(p.Targets, entStr) {
+			if entStr == "" || !contains(s.targetIDs(p), entStr) {
 				s.reject(L.t("不能选这个", "That can't be chosen"))
 				return
 			}
@@ -770,7 +785,7 @@ func (s *Session) onAttack(c Command, ent int, entStr string) {
 	L := s.lab
 	switch c.Command {
 	case "select_card":
-		if contains(p.optionIDs("POSSIBLE_ATTACKERS"), entStr) || s.isAttacking(entStr) {
+		if contains(p.optionIDs("possibleAttackers"), entStr) || s.isAttacking(entStr) {
 			s.pendingDefender = s.defender
 			s.answer("uuid", entStr)
 			return
@@ -836,7 +851,7 @@ func (s *Session) onBlock(c Command, entStr string) {
 			return
 		}
 		att, _ := s.ids.back(*c.TargetID)
-		if !contains(p.optionIDs("POSSIBLE_BLOCKERS"), entStr) || !s.isAttacking(att) {
+		if !contains(p.optionIDs("possibleBlockers"), entStr) || !s.isAttacking(att) {
 			s.reject(L.t("挡不了这个进攻者", "Can't block that attacker"))
 			return
 		}

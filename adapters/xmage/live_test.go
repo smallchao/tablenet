@@ -95,26 +95,53 @@ func (t *tally) report(tt *testing.T, who string) {
 
 // opponent：XMage 那边的玩家（直接用驱动开会话，像 XMage 客户端一样逐个回答，能下地就下地，其余让过）。
 func opponent(t *testing.T, ctx context.Context, drv *Driver, server, password string, tl *tally) (tableID string) {
+	return xmagePlayer(t, ctx, drv, server, "", password, tl)
+}
+
+// xmagePlayer：XMage 那边的一位玩家。joinName 为空时自己建桌当桌主（坐满后开打）；
+// 否则照交接信息在主房间里按桌名找到那张桌、凭密码坐下（像拿着交接信息去 XMage 客户端里的玩家）。
+func xmagePlayer(t *testing.T, ctx context.Context, drv *Driver, server, joinName, password string, tl *tally) (tableID string) {
 	host, portS, _ := net.SplitHostPort(server)
 	port, _ := strconv.Atoi(portS)
 	ev := drv.Subscribe("opp")
 	if _, err := drv.Call(ctxN(30*time.Second), "connect", map[string]any{"s": "opp", "host": host, "port": port, "user": "opp_live"}); err != nil {
 		t.Fatal(err)
 	}
-	res, err := drv.Call(ctxN(30*time.Second), "create_table", map[string]any{"s": "opp", "name": "Tablenet live", "gameType": "Two Player Duel",
-		"deckType": "Constructed - Freeform", "seats": 2, "password": password})
-	if err != nil {
-		t.Fatal(err)
-	}
 	var tb Table
-	_ = decodeAs(res, "table", &tb)
+	owner := joinName == ""
+	if owner {
+		res, err := drv.Call(ctxN(30*time.Second), "create_table", map[string]any{"s": "opp", "name": "Tablenet live", "gameType": "Two Player Duel",
+			"deckType": "Constructed - Freeform", "seats": 2, "password": password})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = decodeAs(res, "table", &tb)
+	} else {
+		deadline := time.Now().Add(20 * time.Second)
+		for tb.ID == "" {
+			res, err := drv.Call(ctxN(10*time.Second), "tables", map[string]any{"s": "opp"})
+			if err == nil {
+				var ts []Table
+				_ = decodeAs(res, "tables", &ts)
+				for _, x := range ts {
+					if x.Name == joinName {
+						tb = x
+					}
+				}
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf("XMage 主房间里找不到桌子 %q", joinName)
+			}
+			time.Sleep(300 * time.Millisecond)
+		}
+	}
 	if _, err := drv.Call(ctxN(30*time.Second), "join_table", map[string]any{"s": "opp", "table": tb.ID, "name": "opp_live",
 		"deck": parseDeck(liveDeck), "password": password}); err != nil {
 		t.Fatal(err)
 	}
 	go func() {
 		game := ""
-		started := false
+		started := !owner
 		tick := time.NewTicker(500 * time.Millisecond)
 		defer tick.Stop()
 		for {
@@ -141,12 +168,14 @@ func opponent(t *testing.T, ctx context.Context, drv *Driver, server, password s
 			case e := <-ev:
 				tl.add(e.M)
 				var d struct {
-					Game     string         `json:"game"`
-					Message  string         `json:"message"`
-					Targets  []string       `json:"targets"`
-					Options  map[string]any `json:"options"`
-					Choices  []struct{ ID string `json:"id"` } `json:"choices"`
-					View     *struct {
+					Game    string         `json:"game"`
+					Message string         `json:"message"`
+					Targets []string       `json:"targets"`
+					Options map[string]any `json:"options"`
+					Choices []struct {
+						ID string `json:"id"`
+					} `json:"choices"`
+					View *struct {
 						Playable map[string]struct {
 							Names []string `json:"names"`
 						} `json:"playable"`
@@ -176,7 +205,7 @@ func opponent(t *testing.T, ctx context.Context, drv *Driver, server, password s
 							}
 						}
 					}
-					ans("bool", e.M == "GAME_SELECT" && d.Options["POSSIBLE_ATTACKERS"] != nil)
+					ans("bool", e.M == "GAME_SELECT" && d.Options["possibleAttackers"] != nil)
 				case "GAME_TARGET":
 					if len(d.Targets) > 0 {
 						ans("uuid", d.Targets[0])
@@ -381,7 +410,7 @@ func TestLiveBridge(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer p.Close()
-	roomID := "test.local/xmage-" + tableID
+	roomID := "test.local/xmage-" + localID("x", tableID)
 	deadline := time.Now().Add(4 * time.Minute) // 适配器第一次要建本地牌库
 	for {
 		e, err := p.Request(ctxN(5*time.Second), "room.list", map[string]any{"venue": PlatformID})
@@ -457,5 +486,137 @@ func TestLiveBridge(t *testing.T) {
 	if over == nil {
 		t.Fatal("没打完：没收到 match_over")
 	}
+	if errorsSeen > 5 {
+		t.Fatalf("客人收到 %d 次 error：多半是某种提问原地打转", errorsSeen)
+	}
 	t.Logf("结束：%v", over)
+}
+
+// 排队配到 XMage：一位能桥接、一位只能交接。机器人建带密码的桌（不坐下），桥接的那位由适配器替他坐下，
+// 交接的那位拿着服务器、桌名、密码去 XMage 里坐（这里用驱动会话代替 XMage 客户端），坐满后机器人开打。
+func TestLiveQueue(t *testing.T) {
+	server, dc := liveEnv(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+	oppTally, guestTally := &tally{kinds: map[string]int{}}, &tally{kinds: map[string]int{}}
+	n := nodetest.Start(t, nodetest.Options{Adapters: map[string]nodetest.Adapter{PlatformID: {Servers: []string{"127.0.0.1"}, TrustResults: true}}})
+	ac := dc
+	ac.WorkDir = filepath.Join(dc.WorkDir, "adapter")
+	if f, err := os.Create(filepath.Join(dc.WorkDir, "adapter-queue.log")); err == nil {
+		ac.Stderr = f
+	}
+	go func() {
+		h := slog.New(slog.NewTextHandler(tlog{t}, &slog.HandlerOptions{Level: slog.LevelInfo}))
+		_ = Run(ctx, Config{NodeURL: n.URL, Server: server, LobbyUser: "tablenet_q", PollEvery: 300 * time.Millisecond, Driver: ac}, proto.GenerateKey(), h)
+	}()
+	dialP := func(codecs []string) *client.Client {
+		c, err := client.Dial(ctxN(10*time.Second), n.URL, proto.GenerateKey(), map[string]any{"role": "player", "displayName": "排队玩家",
+			"venues": []string{PlatformID}, "codecs": codecs, "locale": "zh-CN"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(c.Close)
+		return c
+	}
+	a, b := dialP([]string{Codec}), dialP(nil)
+	// 等适配器上线（节点 welcome 里有了 xmage 平台才能配到它）
+	deadline := time.Now().Add(4 * time.Minute)
+	pools := map[string]any{"pools": []map[string]string{{"format": "casual", "gameType": "duel", "structure": "bo1"}}}
+	var matchID any
+	for matchID == nil {
+		for _, c := range []*client.Client{a, b} {
+			_, _ = c.Request(ctxN(5*time.Second), "queue.enter", pools)
+		}
+		mctx, mcancel := context.WithTimeout(ctx, 3*time.Second)
+		m, err := a.Expect(mctx, "queue.match")
+		mcancel()
+		if err == nil && client.DecodeBody(m)["venue"] == PlatformID {
+			matchID = client.DecodeBody(m)["matchId"]
+			break
+		}
+		for _, c := range []*client.Client{a, b} {
+			_, _ = c.Request(ctxN(5*time.Second), "queue.leave", nil)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("排队一直没配到 XMage")
+		}
+	}
+	for _, c := range []*client.Client{a, b} {
+		if e, err := c.Request(ctxN(5*time.Second), "queue.accept", map[string]any{"matchId": matchID}); err != nil || e.Type != "queue.accepted" {
+			t.Fatal(e, err)
+		}
+	}
+	br, err := a.Expect(ctxN(30*time.Second), "match.bridged")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ho, err := b.Expect(ctxN(30*time.Second), "match.handoff")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn := client.DecodeBody(ho)["handoff"].(map[string]any)["connect"].(map[string]any)
+	t.Logf("交接信息：%v", conn)
+	if conn["client"] != "xmage" || conn["password"] == nil || conn["room"] == nil {
+		t.Fatal("交接信息不全", conn)
+	}
+
+	// 交接的那位去 XMage 坐下
+	oc := dc
+	oc.WorkDir = filepath.Join(dc.WorkDir, "opponent")
+	od, err := StartDriver(oc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer od.Close()
+	if _, err := od.Call(ctxN(5*time.Minute), "cards", nil); err != nil {
+		t.Fatal(err)
+	}
+	xmagePlayer(t, ctx, od, server, conn["room"].(string), conn["password"].(string), oppTally)
+
+	// 桥接的那位在独弈里打
+	g := &liveGuest{c: a, ch: uint32(client.DecodeBody(br)["channel"].(float64))}
+	defer g.dump()
+	g.send(map[string]any{"type": "join", "protocolVersion": arcaneProtocolVersion, "name": "Queue Guest", "deck": liveDeck})
+	skip := map[any]bool{}
+	answered, errorsSeen := 0, 0
+	var over map[string]any
+	stop := time.Now().Add(4 * time.Minute)
+	for time.Now().Before(stop) && over == nil {
+		m, ok := g.next(ctx)
+		if !ok {
+			break
+		}
+		switch m["type"] {
+		case "join_rejected":
+			t.Fatalf("桥接被拒：%v", m)
+		case "error":
+			errorsSeen++
+			guestTally.note(fmt.Sprintf("error %v %v", m["code"], m["message"]))
+		case "match_over":
+			over = m
+		case "choice_request", "modal_request", "number_request", "text_request", "allocation_request":
+			k, _ := m["type"].(string)
+			if kind, ok := m["kind"].(string); ok {
+				k += ":" + kind
+			}
+			guestTally.add(k)
+			if cmd := guestAnswer(m, skip); cmd != nil {
+				answered++
+				g.send(cmd)
+			}
+		}
+		if answered == 120 {
+			g.send(map[string]any{"type": "command", "command": "concede"})
+			answered++
+		}
+	}
+	oppTally.report(t, "交接到 XMage 的玩家")
+	guestTally.report(t, "桥接的独弈玩家")
+	if over == nil {
+		t.Fatal("没打完：没收到 match_over")
+	}
+	if errorsSeen > 5 {
+		t.Fatalf("客人收到 %d 次 error：多半是某种提问原地打转", errorsSeen)
+	}
+	t.Logf("结束：%v，共 %d 帧", over, len(g.all))
 }

@@ -292,33 +292,86 @@ func (h *Hub) HandleText(c *conn, data []byte) {
 	}
 }
 
+// 对局帧最多占到发送队列的这么多格：留出余量给文本消息（ping、通道通知），免得它们因为队列被大帧塞满而把人踢掉。
+const binaryQueue = sendQueue - 64
+
+// 收方一直腾不出地方、发方的帧等了这么久还进不去，才算收方卡死了，踢掉它。
+const binaryStall = 60 * time.Second
+
 // HandleBinary 转发一帧对局数据：只认通道号，不看负载。
+//
+// 收方的队列快满了就在这里等（不拿节点锁）：发方这条连接的读协程停下来，TCP 的流控一路传回发方，
+// 发方自然放慢。以前是队列一满就踢收方——卡图、DIY 牌这类几十 MB 的大块，上行快、下行慢的一对
+// （跨境线路晚高峰很常见）一传就把收方踢下线。
 func (h *Hub) HandleBinary(c *conn, data []byte) {
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if c.dead || !c.authed {
+		h.mu.Unlock()
 		return
 	}
 	ch, _, ok := proto.DecodeFrame(data)
 	if !ok {
+		h.mu.Unlock()
 		return
 	}
 	link := h.channels[ch]
 	if link == nil {
+		h.mu.Unlock()
 		return
 	}
-	var peer connID
+	var peerID connID
 	switch c.id {
 	case link.host:
-		peer = link.guest
+		peerID = link.guest
 	case link.guest:
-		peer = link.host
+		peerID = link.host
 	default:
+		h.mu.Unlock()
 		return // 不是这条通道的人
 	}
+	peer := h.conns[peerID]
 	metricRelayFrames.Add(1)
 	metricRelayBytes.Add(int64(len(data)))
-	h.push(h.conns[peer], outMsg{binary: true, data: data})
+	if peer == nil || peer.dead {
+		h.mu.Unlock()
+		return
+	}
+	if len(peer.out) < binaryQueue {
+		h.push(peer, outMsg{binary: true, data: data})
+		h.mu.Unlock()
+		return
+	}
+	h.mu.Unlock()
+
+	deadline := time.Now().Add(binaryStall)
+	tick := time.NewTicker(5 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-peer.done:
+			return
+		case <-c.done:
+			return
+		case <-tick.C:
+		}
+		h.mu.Lock()
+		if peer.dead || c.dead {
+			h.mu.Unlock()
+			return
+		}
+		if len(peer.out) < binaryQueue {
+			h.push(peer, outMsg{binary: true, data: data})
+			h.mu.Unlock()
+			return
+		}
+		if time.Now().After(deadline) {
+			h.log.Warn("conn.stalled", "conn", peer.id)
+			h.kick(peer, "收得太慢")
+			h.mu.Unlock()
+			return
+		}
+		h.mu.Unlock()
+	}
 }
 
 // allow 是每连接的令牌桶，只限文本消息；对局帧不限。

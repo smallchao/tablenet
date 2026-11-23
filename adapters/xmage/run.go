@@ -39,7 +39,7 @@ type bridgeRun struct {
 }
 
 func newBridgeRun(a *Adapter, ch uint32, playerID, name string, info seatInfo) *bridgeRun {
-	return &bridgeRun{a: a, ch: ch, playerID: playerID, name: name, info: info, sess: fmt.Sprintf("p%d", ch),
+	return &bridgeRun{a: a, ch: ch, playerID: playerID, name: name, info: info, sess: fmt.Sprintf("%s.p%d", info.srv.cfg.ID, ch),
 		in: make(chan []byte, 256), done: make(chan struct{})}
 }
 
@@ -117,7 +117,7 @@ func (b *bridgeRun) call(ctx context.Context, op string, body map[string]any) (m
 	body["s"] = b.sess
 	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	return b.a.drv.Call(rctx, op, body)
+	return b.info.srv.drv.Call(rctx, op, body)
 }
 
 func (b *bridgeRun) run(ctx context.Context) error {
@@ -157,18 +157,26 @@ func (b *bridgeRun) run(ctx context.Context) error {
 	}
 
 	// 2. 开一个 XMage 会话，坐下、交牌组。
-	events := b.a.drv.Subscribe(b.sess)
-	defer b.a.drv.Unsubscribe(b.sess)
+	drv := b.info.srv.drv
+	events := drv.Subscribe(b.sess)
+	defer drv.Unsubscribe(b.sess)
 	defer func() {
 		dctx, dcancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer dcancel()
 		if b.game != "" {
-			_, _ = b.a.drv.Call(dctx, "quit_match", map[string]any{"s": b.sess, "game": b.game})
+			_, _ = drv.Call(dctx, "quit_match", map[string]any{"s": b.sess, "game": b.game})
 		}
-		_, _ = b.a.drv.Call(dctx, "disconnect", map[string]any{"s": b.sess})
+		_, _ = drv.Call(dctx, "disconnect", map[string]any{"s": b.sess})
 	}()
-	if _, err := b.call(ctx, "connect", map[string]any{"host": b.a.host, "port": b.a.port, "user": xmageUser(b.name)}); err != nil {
-		b.reject("host_unreachable", "连不上 XMage："+err.Error())
+	srv := b.info.srv
+	if _, err := b.call(ctx, "connect", map[string]any{"host": srv.host, "port": srv.port, "user": xmageUser(b.name)}); err != nil {
+		if isAuthError(err) {
+			// 这台服务器其实要注册：以后它的桌子只做交接（适配器不经手玩家的 XMage 密码）
+			srv.noBridge()
+			b.reject("account_required", srv.cfg.Name+" 要用注册过的 XMage 账号登录，只能在 XMage 客户端里用自己的账号打："+err.Error())
+			return err
+		}
+		b.reject("host_unreachable", "连不上 "+srv.cfg.Name+"："+err.Error())
 		return err
 	}
 	if _, err := b.call(ctx, "join_table", map[string]any{"table": b.info.table.ID, "name": xmageUser(b.name),
@@ -270,13 +278,13 @@ func (b *bridgeRun) onXMage(ctx context.Context, sess *bridge.Session, ev Event)
 		}
 	case "END_GAME_INFO":
 		var d struct {
-			Wins  int `json:"wins"`
-			Loses int `json:"loses"`
+			Wins int `json:"wins"`
 		}
 		_ = json.Unmarshal(ev.D, &d)
 		if sess.GameOver(ev.D, b.games) {
 			b.send(map[string]any{"type": "match_over", "winner": nil, "gamesPlayed": b.games})
-			b.a.report(b.info.match, b.info.localID, b.playerID, d.Wins, d.Loses)
+			// 一对一时对手赢的局数＝打了几局减去我赢的（不计平局）
+			b.a.report(b.info.match, b.info.localID, b.playerID, d.Wins, b.games-d.Wins)
 			return true
 		}
 	case "SIDEBOARD":

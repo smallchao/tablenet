@@ -94,17 +94,19 @@ type Playable struct {
 }
 
 type View struct {
-	Turn               int                 `json:"turn"`
-	Phase              string              `json:"phase"`
-	Step               string              `json:"step"`
-	ActivePlayerID     string              `json:"activePlayerId"`
-	PriorityPlayerName string              `json:"priorityPlayerName"`
-	Players            []Player            `json:"players"`
-	MyPlayerID         string              `json:"myPlayerId"`
-	Hand               []Card              `json:"hand"`
-	Stack              []Card              `json:"stack"`
-	Exile              []struct{ Cards []Card `json:"cards"` } `json:"exile"`
-	Revealed           []struct {
+	Turn               int      `json:"turn"`
+	Phase              string   `json:"phase"`
+	Step               string   `json:"step"`
+	ActivePlayerID     string   `json:"activePlayerId"`
+	PriorityPlayerName string   `json:"priorityPlayerName"`
+	Players            []Player `json:"players"`
+	MyPlayerID         string   `json:"myPlayerId"`
+	Hand               []Card   `json:"hand"`
+	Stack              []Card   `json:"stack"`
+	Exile              []struct {
+		Cards []Card `json:"cards"`
+	} `json:"exile"`
+	Revealed []struct {
 		Name  string `json:"name"`
 		Cards []Card `json:"cards"`
 	} `json:"revealed"`

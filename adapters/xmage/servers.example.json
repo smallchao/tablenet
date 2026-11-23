@@ -1,0 +1,20 @@
+[
+  {
+    "id": "de",
+    "name": "xmage.de",
+    "address": "xmage.de:17171",
+    "user": "tablenet",
+    "password": "",
+    "accounts": "optional",
+    "queue": true
+  },
+  {
+    "id": "us",
+    "name": "某台北美服（要注册）",
+    "address": "us.example.org:17171",
+    "user": "tablenet",
+    "password": "在那台服务器上给机器人注册的密码",
+    "accounts": "required",
+    "lib": "/opt/xmage-1.4.63/mage-client/lib"
+  }
+]

@@ -749,3 +749,41 @@ func TestRateLimit(t *testing.T) {
 		t.Fatal("应当被限流")
 	}
 }
+
+// 收方一时读不动（跨境线路晚高峰、几十 MB 的 DIY 卡图）：节点让发方等着，不再一满就把收方踢掉；帧一帧不丢、按序到。
+func TestSlowReceiverIsNotKicked(t *testing.T) {
+	n := startNode(t, nil)
+	host := native(t, n, "小明")
+	roomID := openRoom(t, host, nil)
+	guest := native(t, n, "阿强")
+	e, err := guest.Request(ctx5(), "room.join", map[string]any{"roomId": roomID, "password": "hunter2"})
+	ch := uint32(must(t, e, err, "room.joined")["channel"].(float64))
+	exp(t, host, "channel.opened")
+
+	// 客人先不读：收件箱 1024 格＋TCP 缓冲＋节点发送队列都塞满还有富余
+	const frames = 2400
+	chunk := make([]byte, 32*1024)
+	sent := make(chan error, 1)
+	go func() {
+		for i := 0; i < frames; i++ {
+			chunk[0], chunk[1] = byte(i), byte(i>>8)
+			if err := host.SendFrame(context.Background(), ch, chunk); err != nil {
+				sent <- err
+				return
+			}
+		}
+		sent <- nil
+	}()
+	time.Sleep(1500 * time.Millisecond)
+	for i := 0; i < frames; i++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		gotCh, p, err := guest.ExpectFrame(ctx)
+		cancel()
+		if err != nil || gotCh != ch || len(p) != len(chunk) || int(p[0])|int(p[1])<<8 != i&0xffff {
+			t.Fatalf("第 %d 帧：%v %d %v", i, gotCh, len(p), err)
+		}
+	}
+	if err := <-sent; err != nil {
+		t.Fatal(err)
+	}
+}

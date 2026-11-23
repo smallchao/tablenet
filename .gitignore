@@ -13,3 +13,6 @@ data/
 node.toml
 dir.toml
 state.json
+
+# XMage 适配器的服务器清单（带机器人密码）
+servers.json

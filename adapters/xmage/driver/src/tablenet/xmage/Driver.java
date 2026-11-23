@@ -189,7 +189,15 @@ public final class Driver {
                 c.setUserData(ud);
                 x.session = new SessionImpl(x);
                 if (!x.session.connectStart(c)) {
+                    // 服务器拒绝登录的原因（例如「Wrong username or password. You must register…」）是登录调用返回之后
+                    // 才用 SHOW_USERMESSAGE 单独发来的：稍等一下把它带上，适配器才认得出「这台要注册」。
                     String why = x.session.getLastError();
+                    for (int i = 0; i < 20 && x.userMessage == null; i++) {
+                        Thread.sleep(100);
+                    }
+                    if (x.userMessage != null) {
+                        why = x.userMessage;
+                    }
                     throw new IllegalStateException("连不上 XMage：" + (why == null || why.isEmpty() ? "未知原因" : why));
                 }
                 sessions.put(s, x);
@@ -452,6 +460,7 @@ public final class Driver {
         Session session;
         UUID roomId;
         volatile String lastMessage;
+        volatile String userMessage; // 最近一条 SHOW_USERMESSAGE 的正文
         private final UUID clientId = UUID.randomUUID();
 
         Sess(String name) {
@@ -506,6 +515,10 @@ public final class Driver {
         public void onCallback(ClientCallback cb) {
             try {
                 cb.decompressData();
+                if (cb.getMethod() == mage.interfaces.callback.ClientCallbackMethod.SHOW_USERMESSAGE && cb.getData() instanceof List) {
+                    List<?> lines = (List<?>) cb.getData();
+                    userMessage = lines.isEmpty() ? "" : String.valueOf(lines.get(lines.size() - 1));
+                }
                 Object data = Views.data(cb.getMethod(), cb.getData());
                 event(cb.getMethod().name(), cb.getObjectId(), data);
             } catch (Throwable e) {

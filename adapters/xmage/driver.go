@@ -42,11 +42,11 @@ type Driver struct {
 
 // DriverConfig：怎么起 Java 驱动。
 type DriverConfig struct {
-	Java    string // java 可执行文件，默认 PATH 里的 java
-	Jar     string // 驱动的 jar（build.sh 打出来的 tablenet-xmage-driver.jar）或 classes 目录
+	Java     string // java 可执行文件，默认 PATH 里的 java
+	Jar      string // 驱动的 jar（build.sh 打出来的 tablenet-xmage-driver.jar）或 classes 目录
 	XMageLib string // XMage 服务器的 lib 目录（mage-common 等 jar 都在这）
-	WorkDir string // 驱动的工作目录：本地牌库 db/ 建在这里
-	Stderr  io.Writer
+	WorkDir  string // 驱动的工作目录：本地牌库 db/ 建在这里
+	Stderr   io.Writer
 }
 
 // StartDriver 起驱动进程。

@@ -246,7 +246,7 @@ func (s *Session) stateJSON() map[string]any {
 		"activePlayerId": active, "viewingPlayerId": s.mySeat(), "dayTime": nil,
 		"poisonCountersToLose": 10, "stormCount": 0, "monarchPlayerId": s.flagSeat(func(p Player) bool { return p.Monarch }),
 		"initiativePlayerId": s.flagSeat(func(p Player) bool { return p.Initiative }),
-		"planarPlayerId": nil, "stackSize": len(stack), "stack": stack, "pendingCasts": []any{},
+		"planarPlayerId":     nil, "stackSize": len(stack), "stack": stack, "pendingCasts": []any{},
 		"combat": combatState, "revealedCards": revealed, "visibleZones": []any{}, "phaseStops": []any{},
 		"autoPassMode": "off", "yieldMarker": nil,
 		"yieldSettings": map[string]bool{"abilityScope": false, "autoYieldsDisabled": true, "autoTriggersDisabled": true},
