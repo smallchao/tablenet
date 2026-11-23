@@ -77,7 +77,7 @@ go test ./...
 | 房间表字段、赛制映射 | 对得上（`waiting`、`playerJoinable`、`hostingMode: server`） |
 | 进房回的 `seat` | 是本人座位号（房主 0、客人 1） |
 | 密码错 | `wrong_password`，适配器映射成独弈的 `bad_password` |
-| 牌组缺系列或收藏编号 | **hub 拒收（`invalid_deck`），基本地也一样**。适配器改成先拦下、说清是哪几张 |
+| 牌组缺系列或收藏编号 | **hub 拒收（`invalid_deck`），基本地也一样**。适配器改成先拦下、说清是哪几张。独弈 0.4 起在 `join` 里另附 `printedDeck`（每行 `张数 牌名\|系列\|收藏编号`，客户端按自己的卡牌库补齐，没挑版本的用默认那一版），适配器优先用它；`deck` 是 .dck 原文，`\|` 后面那个数是 Forge 的画稿序号，不能当收藏编号 |
 | `client.load_complete` | **必须是带 `id` 的请求**，不带回 `invalid_message`、对局开不了。原来发的是通知，已修；模拟 hub 也照此要求 |
 | 自己认输 | `game.conceded` 作为请求的回话回来（带 `id`），适配器已按此处理 |
 | 房主离开 | 房间解散（`room.disbanded`），房间表随即消失。排队建房由桥接玩家自己建，避开了这一点 |

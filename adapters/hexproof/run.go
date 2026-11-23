@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -111,7 +112,12 @@ func (b *bridgeRun) run(ctx context.Context) error {
 		b.reject("version_mismatch", fmt.Sprintf("双方版本不一致：主机 %d，客机 %v", arcaneProtocolVersion, join["protocolVersion"]))
 		return errors.New("arcane 版本不一致")
 	}
-	deckText, _ := join["deck"].(string)
+	// 独弈 0.4 起另附 printedDeck：每行「张数 牌名|系列|收藏编号」，收藏编号是客户端按自己的卡牌库查好的。
+	// deck 是 .dck 原文，那里「牌名|系列|N」的 N 是 Forge 的画稿序号，当收藏编号用会交错牌；只在老客户端没附时退回它。
+	deckText, _ := join["printedDeck"].(string)
+	if strings.TrimSpace(deckText) == "" {
+		deckText, _ = join["deck"].(string)
+	}
 	main, side, commanders := parseDeck(deckText)
 	if len(main) == 0 {
 		b.reject("missing_deck", "客机没有提交套牌")

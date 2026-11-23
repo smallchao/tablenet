@@ -278,6 +278,9 @@ func (g *guest) dump() {
 	_ = w.Flush()
 }
 
+// dckText：同一副牌的 .dck 原文，| 后面是 Forge 的画稿序号（不是收藏编号）
+const dckText = "[metadata]\nName=Burn\n[Main]\n4 Lightning Bolt|M10|1\n16 Mountain|M10|3\n[Sideboard]\n2 Smash to Smithereens|M11\n"
+
 const deckText = "[metadata]\nName=Burn\n[Main]\n4 Lightning Bolt|M10|146\n16 Mountain|M10|242\n[Sideboard]\n2 Smash to Smithereens|M11|161\n"
 
 func TestLobbyMirror(t *testing.T) {
@@ -337,7 +340,8 @@ func TestBridgeEndToEnd(t *testing.T) {
 	g := &guest{t: t, c: p, ch: uint32(client.DecodeBody(e)["channel"].(float64))}
 	defer g.dump()
 	// 独弈客机连主机时的第一行。
-	g.send(map[string]any{"type": "join", "protocolVersion": arcaneProtocolVersion, "room": "R1", "name": "独弈玩家", "deck": deckText, "password": "x"})
+	// 独弈 0.4 的样子：deck 是 .dck 原文（| 后面是画稿序号），printedDeck 才是收藏编号，适配器要用后者
+	g.send(map[string]any{"type": "join", "protocolVersion": arcaneProtocolVersion, "room": "R1", "name": "独弈玩家", "deck": dckText, "printedDeck": deckText, "password": "x"})
 	joined := g.expect("joined")
 	if joined["seat"] != float64(1) || joined["protocolVersion"] != float64(arcaneProtocolVersion) {
 		t.Fatal(joined)
